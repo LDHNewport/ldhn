@@ -158,6 +158,34 @@ const normalizeToken = (value: unknown) =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "");
 
+const normalizeTeamAlias = (value: unknown) => {
+  const token = normalizeToken(value);
+  return token.replace(/^(les|le|la|l)/, "");
+};
+
+const levenshtein = (a: string, b: string) => {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
+  const dp: number[] = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const temp = dp[j];
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[j] = Math.min(
+        dp[j] + 1,
+        dp[j - 1] + 1,
+        prev + cost,
+      );
+      prev = temp;
+    }
+  }
+  return dp[b.length];
+};
+
 const DAY_OFFSETS: Record<string, number> = {
   lundi: 0,
   mardi: 1,
@@ -171,11 +199,14 @@ const DAY_OFFSETS: Record<string, number> = {
 const MONTH_INDEX_BY_TOKEN: Record<string, number> = {
   janvier: 0,
   janv: 0,
+  jan: 0,
   fevrier: 1,
+  fev: 1,
   fevr: 1,
   mars: 2,
   avril: 3,
   avr: 3,
+  av: 3,
   mai: 4,
   juin: 5,
   juillet: 6,
@@ -717,17 +748,54 @@ const MatchesTab = () => {
       }
 
       const teamLookup = new Map<string, string>();
+      const aliasEntries: Array<{ alias: string; teamId: string }> = [];
       teams.forEach((team) => {
-        teamLookup.set(team.id.trim().toLowerCase(), team.id);
-        teamLookup.set(team.abbr.trim().toLowerCase(), team.id);
-        teamLookup.set(team.name.trim().toLowerCase(), team.id);
+        const rawName = team.name.trim();
+        const nameToken = normalizeToken(rawName);
+        const aliasToken = normalizeTeamAlias(rawName);
+        const lastWordToken = normalizeTeamAlias(rawName.split(/\s+/).pop() ?? "");
+        const candidates = [
+          team.id.trim().toLowerCase(),
+          team.abbr.trim().toLowerCase(),
+          rawName.toLowerCase(),
+          nameToken,
+          aliasToken,
+          lastWordToken,
+        ];
+        candidates.forEach((candidate) => {
+          if (!candidate) return;
+          teamLookup.set(candidate, team.id);
+          aliasEntries.push({ alias: candidate, teamId: team.id });
+        });
       });
 
       const resolveTeamId = (rawValue: unknown, rowNumber: number, label: string) => {
-        const key = String(rawValue).trim().toLowerCase();
-        const teamId = teamLookup.get(key);
-        if (!teamId) throw new Error(`Ligne ${rowNumber}: ${label} inconnue ("${rawValue}")`);
-        return teamId;
+        const raw = String(rawValue).trim();
+        const direct = teamLookup.get(raw.toLowerCase());
+        if (direct) return direct;
+
+        const normalized = normalizeTeamAlias(raw);
+        const normalizedHit = teamLookup.get(normalized) || teamLookup.get(normalizeToken(raw));
+        if (normalizedHit) return normalizedHit;
+
+        const fuzzy = [...teamLookup.entries()].find(([alias]) => alias.endsWith(normalized) || normalized.endsWith(alias));
+        if (fuzzy) return fuzzy[1];
+
+        const fuzzyScored = aliasEntries
+          .map((entry) => ({
+            ...entry,
+            score: levenshtein(entry.alias, normalized),
+          }))
+          .filter((entry) => entry.score <= Math.max(1, Math.floor(normalized.length * 0.25)))
+          .sort((a, b) => a.score - b.score);
+
+        if (fuzzyScored.length > 0) {
+          const best = fuzzyScored[0];
+          const isAmbiguous = fuzzyScored.length > 1 && fuzzyScored[1].score === best.score && fuzzyScored[1].teamId !== best.teamId;
+          if (!isAmbiguous) return best.teamId;
+        }
+
+        throw new Error(`Ligne ${rowNumber}: ${label} inconnue ("${rawValue}")`);
       };
 
       const arrayBuffer = await file.arrayBuffer();

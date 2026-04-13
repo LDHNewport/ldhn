@@ -37,7 +37,7 @@ const Matches = () => {
       const { data, error } = await supabase
         .from("matches")
         .select("*, home_team:teams!matches_home_team_id_fkey(*), away_team:teams!matches_away_team_id_fkey(*)")
-        .order("match_date", { ascending: false });
+        .order("match_date", { ascending: true });
       if (error) throw error;
       return data as MatchWithTeams[];
     },

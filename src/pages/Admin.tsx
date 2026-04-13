@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { Link } from "react-router-dom";
@@ -16,6 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import type { Tables } from "@/integrations/supabase/types";
 import LiveMatchControl from "@/components/matches/LiveMatchControl";
 import type { Session } from "@supabase/supabase-js";
+import * as XLSX from "xlsx";
 
 type Team = Tables<"teams">;
 type Player = Tables<"players">;
@@ -33,6 +34,8 @@ interface MatchWithTeams {
   home_coach_initials: string | null;
   away_coach_initials: string | null;
   lineup_confirmed: boolean;
+  home_locker_room: string | null;
+  away_locker_room: string | null;
   home_team: Team;
   away_team: Team;
 }
@@ -42,6 +45,287 @@ const POSITIONS = [
   { value: "D", label: "Défenseur" },
   { value: "G", label: "Gardien" },
 ];
+
+type MatchStatus = "scheduled" | "live" | "final";
+type ImportRow = Record<string, unknown>;
+type SheetCell = string | number | boolean | Date | null | undefined;
+type SheetRow = SheetCell[];
+
+const normalizeHeader = (key: string) =>
+  key
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+const rowToNormalizedMap = (row: ImportRow) => {
+  const normalized: ImportRow = {};
+  Object.entries(row).forEach(([key, value]) => {
+    normalized[normalizeHeader(key)] = value;
+  });
+  return normalized;
+};
+
+const pickRowValue = (row: ImportRow, keys: string[]) => {
+  for (const key of keys) {
+    const value = row[key];
+    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  }
+  return undefined;
+};
+
+const parseOptionalNumber = (value: unknown, rowNumber: number, label: string) => {
+  if (value === undefined || value === null || String(value).trim() === "") return undefined;
+  const num = Number(value);
+  if (Number.isNaN(num)) throw new Error(`Ligne ${rowNumber}: valeur invalide pour "${label}"`);
+  return Math.round(num);
+};
+
+const parseOptionalBoolean = (value: unknown, rowNumber: number, label: string) => {
+  if (value === undefined || value === null || String(value).trim() === "") return undefined;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["true", "1", "yes", "oui", "vrai"].includes(normalized)) return true;
+  if (["false", "0", "no", "non", "faux"].includes(normalized)) return false;
+  throw new Error(`Ligne ${rowNumber}: valeur invalide pour "${label}"`);
+};
+
+const parseMatchDateCell = (value: unknown, rowNumber: number) => {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
+  if (typeof value === "number") {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (!parsed) throw new Error(`Ligne ${rowNumber}: date Excel invalide`);
+    const date = new Date(parsed.y, parsed.m - 1, parsed.d, parsed.H ?? 0, parsed.M ?? 0, Math.floor(parsed.S ?? 0));
+    return date.toISOString();
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) throw new Error(`Ligne ${rowNumber}: date de match manquante`);
+    const normalized = trimmed.includes("T") ? trimmed : trimmed.replace(" ", "T");
+    const date = new Date(normalized);
+    if (Number.isNaN(date.getTime())) {
+      throw new Error(`Ligne ${rowNumber}: format de date invalide (utilise ISO, ex: 2026-04-15 19:30)`);
+    }
+    return date.toISOString();
+  }
+  throw new Error(`Ligne ${rowNumber}: date de match invalide`);
+};
+
+const parseStatus = (value: unknown): MatchStatus => {
+  const normalized = String(value ?? "scheduled").trim().toLowerCase();
+  const statusMap: Record<string, MatchStatus> = {
+    scheduled: "scheduled",
+    programme: "scheduled",
+    programmé: "scheduled",
+    live: "live",
+    en_cours: "live",
+    en_direct: "live",
+    final: "final",
+    termine: "final",
+    terminé: "final",
+  };
+  return statusMap[normalized] ?? "scheduled";
+};
+
+const TeamBadge = ({ team, size = "md" }: { team: Team; size?: "sm" | "md" }) => {
+  const sizeClass = size === "sm" ? "w-8 h-8 text-[10px]" : "w-10 h-10 text-xs";
+
+  if (team.logo_url) {
+    return (
+      <img
+        src={team.logo_url}
+        alt={`Logo ${team.name}`}
+        className={`${sizeClass} rounded-full object-cover border-2 bg-background`}
+        style={{ borderColor: team.color }}
+      />
+    );
+  }
+
+  return (
+    <div className={`${sizeClass} rounded-full flex items-center justify-center font-bold border-2`} style={{ borderColor: team.color, color: team.color }}>
+      {team.abbr}
+    </div>
+  );
+};
+
+const normalizeToken = (value: unknown) =>
+  String(value ?? "")
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+
+const DAY_OFFSETS: Record<string, number> = {
+  lundi: 0,
+  mardi: 1,
+  mercredi: 2,
+  jeudi: 3,
+  vendredi: 4,
+  samedi: 5,
+  dimanche: 6,
+};
+
+const MONTH_INDEX_BY_TOKEN: Record<string, number> = {
+  janvier: 0,
+  janv: 0,
+  fevrier: 1,
+  fevr: 1,
+  mars: 2,
+  avril: 3,
+  avr: 3,
+  mai: 4,
+  juin: 5,
+  juillet: 6,
+  juil: 6,
+  aout: 7,
+  septembre: 8,
+  sept: 8,
+  octobre: 9,
+  oct: 9,
+  novembre: 10,
+  nov: 10,
+  decembre: 11,
+  dec: 11,
+};
+
+const parseWeekStartCell = (cell: SheetCell, defaultYear: number) => {
+  const raw = String(cell ?? "").trim();
+  if (!raw) return null;
+  const normalized = raw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  if (!normalized.includes("sem") || !normalized.includes("au")) return null;
+
+  const match = normalized.match(/(\d{1,2})\s*au\s*(\d{1,2})?\s*([a-z.]+)/);
+  if (!match) return null;
+
+  const day = Number(match[1]);
+  const monthToken = normalizeToken(match[3]);
+  const monthIndex = MONTH_INDEX_BY_TOKEN[monthToken];
+  if (Number.isNaN(day) || monthIndex === undefined) return null;
+
+  return new Date(defaultYear, monthIndex, day, 0, 0, 0, 0);
+};
+
+const parseTimeRangeStart = (cell: SheetCell) => {
+  const raw = String(cell ?? "").trim();
+  if (!raw) return null;
+  const match = raw.match(/(\d{1,2})h(?:([0-9]{1,2}))?/i);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2] ?? "0");
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+  return { hours, minutes };
+};
+
+const hasValue = (cell: SheetCell) => String(cell ?? "").trim() !== "";
+
+const isSplitArenaScheduleLayout = (gridRows: SheetRow[]) => {
+  const header = gridRows[0] ?? [];
+  const h0 = normalizeToken(header[0]);
+  const h1 = normalizeToken(header[1]);
+  const h2 = normalizeToken(header[2]);
+  const h3 = normalizeToken(header[3]);
+  const h5 = normalizeToken(header[5]);
+  const looksLikeClassicHeader = h0 === "date" && h1 === "heure" && h2 === "division" && (h3.includes("quipe") || h3.includes("team")) && (h5.includes("quipe") || h5.includes("team"));
+  if (!looksLikeClassicHeader) return false;
+
+  // Right-side block has empty header keys in this format but data in column 7+.
+  return gridRows.slice(1).some((row) => hasValue(row[7]) || hasValue(row[8]) || hasValue(row[10]));
+};
+
+const parseSplitArenaScheduleRows = ({
+  gridRows,
+  resolveTeamId,
+}: {
+  gridRows: SheetRow[];
+  resolveTeamId: (rawValue: unknown, rowNumber: number, label: string) => string;
+}) => {
+  const defaultYear = new Date().getFullYear();
+  const contexts = [
+    { weekStart: null as Date | null, dayLabel: "" },
+    { weekStart: null as Date | null, dayLabel: "" },
+  ];
+  const parsed: Record<string, unknown>[] = [];
+
+  for (let rowIndex = 1; rowIndex < gridRows.length; rowIndex += 1) {
+    const row = gridRows[rowIndex] ?? [];
+
+    [0, 7].forEach((offset, blockIndex) => {
+      const blockLabel = blockIndex === 0 ? "bloc gauche" : "bloc droit";
+      const ctx = contexts[blockIndex];
+
+      const dateCell = row[offset];
+      const timeCell = row[offset + 1];
+      const homeTeamCell = row[offset + 3];
+      const homeRoomCell = row[offset + 4];
+      const awayTeamCell = row[offset + 5];
+      const awayRoomCell = row[offset + 6];
+
+      if (![dateCell, timeCell, homeTeamCell, awayTeamCell, homeRoomCell, awayRoomCell].some(hasValue)) return;
+
+      const weekStart = parseWeekStartCell(dateCell, defaultYear);
+      if (weekStart) {
+        ctx.weekStart = weekStart;
+        ctx.dayLabel = "";
+        return;
+      }
+
+      if (hasValue(dateCell)) {
+        ctx.dayLabel = String(dateCell).trim();
+      }
+
+      const homeRaw = String(homeTeamCell ?? "").trim();
+      const awayRaw = String(awayTeamCell ?? "").trim();
+      if (!homeRaw || !awayRaw) return;
+
+      if (!ctx.weekStart) {
+        throw new Error(`Ligne ${rowIndex + 1}: semaine introuvable avant match (${blockLabel}).`);
+      }
+      if (!ctx.dayLabel) {
+        throw new Error(`Ligne ${rowIndex + 1}: jour introuvable avant match (${blockLabel}).`);
+      }
+
+      const dayKey = normalizeToken(ctx.dayLabel);
+      const dayOffset = DAY_OFFSETS[dayKey];
+      if (dayOffset === undefined) {
+        throw new Error(`Ligne ${rowIndex + 1}: jour invalide "${ctx.dayLabel}" (${blockLabel}).`);
+      }
+
+      const timeStart = parseTimeRangeStart(timeCell);
+      if (!timeStart) {
+        throw new Error(`Ligne ${rowIndex + 1}: heure invalide "${String(timeCell ?? "")}" (${blockLabel}).`);
+      }
+
+      const homeTeamId = resolveTeamId(homeRaw, rowIndex + 1, `équipe locale (${blockLabel})`);
+      const awayTeamId = resolveTeamId(awayRaw, rowIndex + 1, `équipe visiteuse (${blockLabel})`);
+      if (homeTeamId === awayTeamId) {
+        throw new Error(`Ligne ${rowIndex + 1}: les deux équipes sont identiques (${blockLabel}).`);
+      }
+
+      const matchDate = new Date(ctx.weekStart);
+      matchDate.setDate(ctx.weekStart.getDate() + dayOffset);
+      matchDate.setHours(timeStart.hours, timeStart.minutes, 0, 0);
+
+      parsed.push({
+        home_team_id: homeTeamId,
+        away_team_id: awayTeamId,
+        match_date: matchDate.toISOString(),
+        status: "scheduled",
+        is_live: false,
+        home_locker_room: String(homeRoomCell ?? "").trim() || null,
+        away_locker_room: String(awayRoomCell ?? "").trim() || null,
+      });
+    });
+  }
+
+  return parsed;
+};
 
 // ─── Teams Tab ───────────────────────────────────────────────
 const TeamsTab = () => {
@@ -53,6 +337,8 @@ const TeamsTab = () => {
   const [abbr, setAbbr] = useState("");
   const [color, setColor] = useState("#00cc55");
   const [division, setDivision] = useState("rookies");
+  const [logoUrl, setLogoUrl] = useState("");
+  const [logoUploading, setLogoUploading] = useState(false);
 
   const { data: teams, isLoading } = useQuery({
     queryKey: ["teams"],
@@ -65,11 +351,12 @@ const TeamsTab = () => {
 
   const upsert = useMutation({
     mutationFn: async () => {
+      const payload = { name, abbr: abbr.toUpperCase(), color, division, logo_url: logoUrl || null };
       if (editId) {
-        const { error } = await supabase.from("teams").update({ name, abbr: abbr.toUpperCase(), color, division }).eq("id", editId);
+        const { error } = await supabase.from("teams").update(payload).eq("id", editId);
         if (error) throw error;
       } else {
-        const { error } = await supabase.from("teams").insert({ name, abbr: abbr.toUpperCase(), color, division });
+        const { error } = await supabase.from("teams").insert(payload);
         if (error) throw error;
       }
     },
@@ -90,10 +377,29 @@ const TeamsTab = () => {
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["teams"] }); toast({ title: "Supprimée" }); },
   });
 
-  const resetForm = () => { setEditId(null); setName(""); setAbbr(""); setColor("#00cc55"); setDivision("rookies"); };
+  const resetForm = () => { setEditId(null); setName(""); setAbbr(""); setColor("#00cc55"); setDivision("rookies"); setLogoUrl(""); };
 
   const startEdit = (t: Team) => {
-    setEditId(t.id); setName(t.name); setAbbr(t.abbr); setColor(t.color); setDivision(t.division); setOpen(true);
+    setEditId(t.id); setName(t.name); setAbbr(t.abbr); setColor(t.color); setDivision(t.division); setLogoUrl(t.logo_url || ""); setOpen(true);
+  };
+
+  const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLogoUploading(true);
+    const ext = file.name.split(".").pop();
+    const path = `teams/${Date.now()}.${ext}`;
+    const { error } = await supabase.storage.from("media").upload(path, file);
+    if (error) {
+      toast({ title: "Erreur upload logo", variant: "destructive" });
+      setLogoUploading(false);
+      e.target.value = "";
+      return;
+    }
+    const { data: urlData } = supabase.storage.from("media").getPublicUrl(path);
+    setLogoUrl(urlData.publicUrl);
+    setLogoUploading(false);
+    e.target.value = "";
   };
 
   return (
@@ -110,6 +416,19 @@ const TeamsTab = () => {
               <div><Label>Nom</Label><Input value={name} onChange={(e) => setName(e.target.value)} required /></div>
               <div><Label>Abréviation (3 lettres)</Label><Input value={abbr} onChange={(e) => setAbbr(e.target.value)} maxLength={4} required /></div>
               <div><Label>Couleur</Label><Input type="color" value={color} onChange={(e) => setColor(e.target.value)} /></div>
+              <div>
+                <Label>Logo (optionnel)</Label>
+                <div className="flex gap-2 items-center">
+                  <Input value={logoUrl} onChange={(e) => setLogoUrl(e.target.value)} placeholder="URL ou upload" className="flex-1" />
+                  <Label htmlFor="team-logo-upload" className="cursor-pointer">
+                    <div className="inline-flex items-center gap-1 px-3 py-2 rounded-md bg-secondary text-secondary-foreground text-sm hover:bg-secondary/80">
+                      <Upload className="h-4 w-4" /> {logoUploading ? "..." : "Upload"}
+                    </div>
+                  </Label>
+                  <input id="team-logo-upload" type="file" accept="image/*" className="hidden" onChange={handleLogoUpload} />
+                </div>
+                {logoUrl && <img src={logoUrl} alt="Aperçu logo" className="mt-2 h-16 w-16 object-cover rounded-full border border-border" />}
+              </div>
               <div>
                 <Label>Division</Label>
                 <Select value={division} onValueChange={setDivision}>
@@ -135,9 +454,7 @@ const TeamsTab = () => {
             <Card key={t.id} className="border-l-4" style={{ borderLeftColor: t.color }}>
               <CardContent className="flex items-center justify-between p-4">
                 <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-full flex items-center justify-center text-xs font-bold border-2" style={{ borderColor: t.color, color: t.color }}>
-                    {t.abbr}
-                  </div>
+                  <TeamBadge team={t} />
                   <span className="font-semibold">{t.name}</span>
                 </div>
                 <div className="flex gap-1">
@@ -318,9 +635,14 @@ const MatchesTab = () => {
   const qc = useQueryClient();
   useRealtimeMatches();
   const [open, setOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [replaceCalendar, setReplaceCalendar] = useState(false);
   const [homeTeamId, setHomeTeamId] = useState("");
   const [awayTeamId, setAwayTeamId] = useState("");
   const [matchDate, setMatchDate] = useState("");
+  const [homeLockerRoom, setHomeLockerRoom] = useState("");
+  const [awayLockerRoom, setAwayLockerRoom] = useState("");
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const { data: teams } = useQuery({
     queryKey: ["teams"],
@@ -337,7 +659,7 @@ const MatchesTab = () => {
       const { data, error } = await supabase
         .from("matches")
         .select("*, home_team:teams!matches_home_team_id_fkey(*), away_team:teams!matches_away_team_id_fkey(*)")
-        .order("match_date", { ascending: false });
+        .order("match_date", { ascending: true });
       if (error) throw error;
       return data as MatchWithTeams[];
     },
@@ -349,12 +671,14 @@ const MatchesTab = () => {
         home_team_id: homeTeamId,
         away_team_id: awayTeamId,
         match_date: matchDate || new Date().toISOString(),
+        home_locker_room: homeLockerRoom || null,
+        away_locker_room: awayLockerRoom || null,
       });
       if (error) throw error;
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["matches"] });
-      setOpen(false); setHomeTeamId(""); setAwayTeamId(""); setMatchDate("");
+      setOpen(false); setHomeTeamId(""); setAwayTeamId(""); setMatchDate(""); setHomeLockerRoom(""); setAwayLockerRoom("");
       toast({ title: "Match créé" });
     },
     onError: (e) => toast({ title: "Erreur", description: e.message, variant: "destructive" }),
@@ -386,38 +710,217 @@ const MatchesTab = () => {
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["matches"] }); toast({ title: "Match supprimé" }); },
   });
 
+  const importSchedule = useMutation({
+    mutationFn: async (file: File) => {
+      if (!teams || teams.length === 0) {
+        throw new Error("Aucune équipe disponible. Crée les équipes avant l'import.");
+      }
+
+      const teamLookup = new Map<string, string>();
+      teams.forEach((team) => {
+        teamLookup.set(team.id.trim().toLowerCase(), team.id);
+        teamLookup.set(team.abbr.trim().toLowerCase(), team.id);
+        teamLookup.set(team.name.trim().toLowerCase(), team.id);
+      });
+
+      const resolveTeamId = (rawValue: unknown, rowNumber: number, label: string) => {
+        const key = String(rawValue).trim().toLowerCase();
+        const teamId = teamLookup.get(key);
+        if (!teamId) throw new Error(`Ligne ${rowNumber}: ${label} inconnue ("${rawValue}")`);
+        return teamId;
+      };
+
+      const arrayBuffer = await file.arrayBuffer();
+      const workbook = XLSX.read(arrayBuffer, { type: "array", cellDates: true });
+      const firstSheetName = workbook.SheetNames[0];
+      if (!firstSheetName) throw new Error("Le fichier importé est vide.");
+      const worksheet = workbook.Sheets[firstSheetName];
+      const gridRows = XLSX.utils.sheet_to_json<SheetRow>(worksheet, { header: 1, defval: "" });
+      if (gridRows.length === 0) throw new Error("Aucune ligne trouvée dans le fichier.");
+
+      const inserts: Record<string, unknown>[] = [];
+      const updates: Array<{ id: string; payload: Record<string, unknown> }> = [];
+
+      if (isSplitArenaScheduleLayout(gridRows)) {
+        // Special LDHN schedule format: two weekly blocks side-by-side with day/time + rooms.
+        inserts.push(...parseSplitArenaScheduleRows({ gridRows, resolveTeamId }));
+      } else {
+        const rows = XLSX.utils.sheet_to_json<ImportRow>(worksheet, { defval: "" });
+        if (rows.length === 0) throw new Error("Aucune ligne exploitable trouvée dans le fichier.");
+
+        rows.forEach((rawRow, index) => {
+          const rowNumber = index + 2;
+          const row = rowToNormalizedMap(rawRow);
+
+          const homeRaw = pickRowValue(row, ["home_team", "home", "equipe_locale", "local", "domicile", "home_team_id", "home_abbr"]);
+          const awayRaw = pickRowValue(row, ["away_team", "away", "equipe_visiteuse", "visiteur", "away_team_id", "away_abbr"]);
+          const dateRaw = pickRowValue(row, ["match_date", "date", "date_match", "date_du_match", "datetime"]);
+
+          if (homeRaw === undefined || awayRaw === undefined || dateRaw === undefined) {
+            throw new Error(`Ligne ${rowNumber}: colonnes requises manquantes (home_team, away_team, match_date).`);
+          }
+
+          const homeId = resolveTeamId(homeRaw, rowNumber, "équipe locale");
+          const awayId = resolveTeamId(awayRaw, rowNumber, "équipe visiteuse");
+          if (homeId === awayId) throw new Error(`Ligne ${rowNumber}: les deux équipes sont identiques.`);
+
+          const status = parseStatus(pickRowValue(row, ["status", "etat", "state"]));
+          const homeScore = parseOptionalNumber(pickRowValue(row, ["home_score", "score_home", "score_local"]), rowNumber, "home_score");
+          const awayScore = parseOptionalNumber(pickRowValue(row, ["away_score", "score_away", "score_visiteur"]), rowNumber, "away_score");
+          const isLive = parseOptionalBoolean(pickRowValue(row, ["is_live", "live", "en_direct"]), rowNumber, "is_live");
+          const periodRaw = pickRowValue(row, ["period", "periode"]);
+          const homeLockerRoomRaw = pickRowValue(row, ["home_locker_room", "home_room", "locker_home", "chambre_locale", "vestiaire_local", "chambre_local"]);
+          const awayLockerRoomRaw = pickRowValue(row, ["away_locker_room", "away_room", "locker_away", "chambre_visiteuse", "vestiaire_visiteur", "chambre_visiteur"]);
+
+          const payload: Record<string, unknown> = {
+            home_team_id: homeId,
+            away_team_id: awayId,
+            match_date: parseMatchDateCell(dateRaw, rowNumber),
+            status,
+            is_live: status === "live",
+          };
+
+          if (homeScore !== undefined) payload.home_score = homeScore;
+          if (awayScore !== undefined) payload.away_score = awayScore;
+          if (isLive !== undefined) payload.is_live = isLive;
+          if (periodRaw !== undefined) payload.period = String(periodRaw).trim() || null;
+          if (homeLockerRoomRaw !== undefined) payload.home_locker_room = String(homeLockerRoomRaw).trim() || null;
+          if (awayLockerRoomRaw !== undefined) payload.away_locker_room = String(awayLockerRoomRaw).trim() || null;
+
+          const rowId = String(pickRowValue(row, ["id", "match_id"]) ?? "").trim();
+          if (!replaceCalendar && rowId) {
+            updates.push({ id: rowId, payload });
+          } else {
+            inserts.push(payload);
+          }
+        });
+      }
+
+      if (inserts.length === 0 && updates.length === 0) {
+        throw new Error("Aucun match valide détecté dans le fichier.");
+      }
+
+      if (replaceCalendar) {
+        const { error: deleteError } = await supabase
+          .from("matches")
+          .delete()
+          .neq("id", "00000000-0000-0000-0000-000000000000");
+        if (deleteError) throw deleteError;
+      }
+
+      const chunkSize = 100;
+      for (let i = 0; i < inserts.length; i += chunkSize) {
+        const { error } = await supabase.from("matches").insert(inserts.slice(i, i + chunkSize));
+        if (error) throw error;
+      }
+
+      if (!replaceCalendar) {
+        for (const item of updates) {
+          const { error } = await supabase.from("matches").update(item.payload).eq("id", item.id);
+          if (error) throw error;
+        }
+      }
+
+      return { createdCount: inserts.length, updatedCount: replaceCalendar ? 0 : updates.length, replaced: replaceCalendar };
+    },
+    onSuccess: ({ createdCount, updatedCount, replaced }) => {
+      qc.invalidateQueries({ queryKey: ["matches"] });
+      setImportOpen(false);
+      setReplaceCalendar(false);
+      const parts = [`${createdCount} ajout${createdCount > 1 ? "s" : ""}`];
+      if (updatedCount > 0) parts.push(`${updatedCount} mise${updatedCount > 1 ? "s" : ""} à jour`);
+      if (replaced) parts.push("calendrier remplacé");
+      toast({ title: "Import terminé", description: parts.join(" · ") });
+    },
+    onError: (e) => toast({ title: "Erreur d'import", description: e.message, variant: "destructive" }),
+  });
+
+  const handleImportFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    importSchedule.mutate(file);
+    e.target.value = "";
+  };
+
   return (
     <div className="space-y-4">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-wrap justify-between items-center gap-2">
         <h2 className="font-display text-2xl font-bold text-foreground">Matchs</h2>
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild>
-            <Button className="gap-2"><Plus className="h-4 w-4" /> Nouveau match</Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader><DialogTitle>Créer un match</DialogTitle></DialogHeader>
-            <form onSubmit={(e) => { e.preventDefault(); createMatch.mutate(); }} className="space-y-4">
-              <div>
-                <Label>Équipe locale</Label>
-                <Select value={homeTeamId} onValueChange={setHomeTeamId}>
-                  <SelectTrigger><SelectValue placeholder="Sélectionner..." /></SelectTrigger>
-                  <SelectContent>{teams?.map((t) => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}</SelectContent>
-                </Select>
-              </div>
-              <div>
-                <Label>Équipe visiteuse</Label>
-                <Select value={awayTeamId} onValueChange={setAwayTeamId}>
-                  <SelectTrigger><SelectValue placeholder="Sélectionner..." /></SelectTrigger>
-                  <SelectContent>{teams?.filter((t) => t.id !== homeTeamId).map((t) => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}</SelectContent>
-                </Select>
-              </div>
-              <div><Label>Date du match</Label><Input type="datetime-local" value={matchDate} onChange={(e) => setMatchDate(e.target.value)} /></div>
-              <Button type="submit" className="w-full" disabled={createMatch.isPending || !homeTeamId || !awayTeamId}>
-                {createMatch.isPending ? "..." : "Créer le match"}
+        <div className="flex gap-2">
+          <Dialog open={importOpen} onOpenChange={(v) => { setImportOpen(v); if (!v) setReplaceCalendar(false); }}>
+            <DialogTrigger asChild>
+              <Button variant="outline" className="gap-2">
+                <Upload className="h-4 w-4" /> Importer calendrier
               </Button>
-            </form>
-          </DialogContent>
-        </Dialog>
+            </DialogTrigger>
+            <DialogContent className="max-w-lg">
+              <DialogHeader><DialogTitle>Importer CSV / Excel</DialogTitle></DialogHeader>
+              <div className="space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  Colonnes requises: <span className="font-mono">home_team</span>, <span className="font-mono">away_team</span>, <span className="font-mono">match_date</span>.
+                  Colonnes optionnelles: <span className="font-mono">id</span> (mise à jour), <span className="font-mono">status</span>, <span className="font-mono">home_score</span>, <span className="font-mono">away_score</span>, <span className="font-mono">home_locker_room</span>, <span className="font-mono">away_locker_room</span>.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Format LDHN supporté aussi: <span className="font-mono">Date / Heure / Équipe / Chambres / Vs Équipe / Chambre</span> (même avec deux blocs par ligne).
+                </p>
+                <div className="flex items-center gap-2 text-sm">
+                  <input
+                    id="replace-calendar"
+                    type="checkbox"
+                    checked={replaceCalendar}
+                    onChange={(e) => setReplaceCalendar(e.target.checked)}
+                    disabled={importSchedule.isPending}
+                  />
+                  <Label htmlFor="replace-calendar">Remplacer tout le calendrier avant import</Label>
+                </div>
+                <Button className="w-full gap-2" onClick={() => importInputRef.current?.click()} disabled={importSchedule.isPending}>
+                  <Upload className="h-4 w-4" />
+                  {importSchedule.isPending ? "Import en cours..." : "Choisir un fichier (.csv, .xlsx, .xls)"}
+                </Button>
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept=".csv,.xlsx,.xls"
+                  className="hidden"
+                  onChange={handleImportFileChange}
+                />
+              </div>
+            </DialogContent>
+          </Dialog>
+
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogTrigger asChild>
+              <Button className="gap-2"><Plus className="h-4 w-4" /> Nouveau match</Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader><DialogTitle>Créer un match</DialogTitle></DialogHeader>
+              <form onSubmit={(e) => { e.preventDefault(); createMatch.mutate(); }} className="space-y-4">
+                <div>
+                  <Label>Équipe locale</Label>
+                  <Select value={homeTeamId} onValueChange={setHomeTeamId}>
+                    <SelectTrigger><SelectValue placeholder="Sélectionner..." /></SelectTrigger>
+                    <SelectContent>{teams?.map((t) => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label>Équipe visiteuse</Label>
+                  <Select value={awayTeamId} onValueChange={setAwayTeamId}>
+                    <SelectTrigger><SelectValue placeholder="Sélectionner..." /></SelectTrigger>
+                    <SelectContent>{teams?.filter((t) => t.id !== homeTeamId).map((t) => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+                <div><Label>Date du match</Label><Input type="datetime-local" value={matchDate} onChange={(e) => setMatchDate(e.target.value)} /></div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div><Label>Chambre locale (optionnel)</Label><Input value={homeLockerRoom} onChange={(e) => setHomeLockerRoom(e.target.value)} placeholder="Ex: Chambre 1" /></div>
+                  <div><Label>Chambre visiteuse (optionnel)</Label><Input value={awayLockerRoom} onChange={(e) => setAwayLockerRoom(e.target.value)} placeholder="Ex: Chambre 4" /></div>
+                </div>
+                <Button type="submit" className="w-full" disabled={createMatch.isPending || !homeTeamId || !awayTeamId}>
+                  {createMatch.isPending ? "..." : "Créer le match"}
+                </Button>
+              </form>
+            </DialogContent>
+          </Dialog>
+        </div>
       </div>
 
       {isLoading ? <p className="text-muted-foreground">Chargement...</p> : (
@@ -446,9 +949,7 @@ const MatchesTab = () => {
                 <div className="flex items-center justify-center gap-4">
                   <div className="flex items-center gap-2 flex-1 justify-end">
                     <span className="font-display text-base font-semibold">{match.home_team.name}</span>
-                    <div className="w-8 h-8 rounded-full border-2 flex items-center justify-center text-[10px] font-bold" style={{ borderColor: match.home_team.color, color: match.home_team.color }}>
-                      {match.home_team.abbr}
-                    </div>
+                    <TeamBadge team={match.home_team} size="sm" />
                   </div>
                   <div className="flex items-center gap-1">
                     <span className="font-display text-3xl font-bold w-10 text-center">{match.home_score}</span>
@@ -456,12 +957,19 @@ const MatchesTab = () => {
                     <span className="font-display text-3xl font-bold w-10 text-center">{match.away_score}</span>
                   </div>
                   <div className="flex items-center gap-2 flex-1">
-                    <div className="w-8 h-8 rounded-full border-2 flex items-center justify-center text-[10px] font-bold" style={{ borderColor: match.away_team.color, color: match.away_team.color }}>
-                      {match.away_team.abbr}
-                    </div>
+                    <TeamBadge team={match.away_team} size="sm" />
                     <span className="font-display text-base font-semibold">{match.away_team.name}</span>
                   </div>
                 </div>
+                {(match.home_locker_room || match.away_locker_room) && (
+                  <div className="mt-3 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2">
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground font-bold mb-1">Chambres</p>
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <p><span className="font-bold">{match.home_team.abbr}</span> · {match.home_locker_room || "N/D"}</p>
+                      <p><span className="font-bold">{match.away_team.abbr}</span> · {match.away_locker_room || "N/D"}</p>
+                    </div>
+                  </div>
+                )}
                 {match.is_live && (
                   <div className="text-center mt-2">
                     <span className="text-xs bg-destructive/20 text-destructive px-2 py-1 rounded-full font-bold uppercase tracking-wider">🔴 En direct</span>
@@ -494,7 +1002,7 @@ const LineupTab = () => {
       const { data, error } = await supabase
         .from("matches")
         .select("*, home_team:teams!matches_home_team_id_fkey(*), away_team:teams!matches_away_team_id_fkey(*)")
-        .order("match_date", { ascending: false });
+        .order("match_date", { ascending: true });
       if (error) throw error;
       return data as MatchWithTeams[];
     },

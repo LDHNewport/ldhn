@@ -10,6 +10,7 @@ interface TeamData {
   name: string;
   abbr: string;
   color: string;
+  logo_url?: string | null;
 }
 
 interface MatchData {
@@ -20,6 +21,8 @@ interface MatchData {
   period: string | null;
   match_date: string;
   is_live: boolean;
+  home_locker_room: string | null;
+  away_locker_room: string | null;
   home_team: TeamData;
   away_team: TeamData;
 }
@@ -54,7 +57,11 @@ const ScoreCard = ({ match, isLive }: { match: MatchData; isLive: boolean }) => 
           animate={isLive ? { boxShadow: [`0 0 10px ${match.home_team.color}40`, `0 0 25px ${match.home_team.color}60`, `0 0 10px ${match.home_team.color}40`] } : {}}
           transition={{ duration: 2, repeat: Infinity }}
         >
-          {match.home_team.abbr}
+          {match.home_team.logo_url ? (
+            <img src={match.home_team.logo_url} alt={`Logo ${match.home_team.name}`} className="w-full h-full rounded-full object-cover" />
+          ) : (
+            match.home_team.abbr
+          )}
         </motion.div>
         <span className="text-sm text-muted-foreground font-display tracking-wider">{match.home_team.name}</span>
       </div>
@@ -70,16 +77,36 @@ const ScoreCard = ({ match, isLive }: { match: MatchData; isLive: boolean }) => 
           animate={isLive ? { boxShadow: [`0 0 10px ${match.away_team.color}40`, `0 0 25px ${match.away_team.color}60`, `0 0 10px ${match.away_team.color}40`] } : {}}
           transition={{ duration: 2, repeat: Infinity }}
         >
-          {match.away_team.abbr}
+          {match.away_team.logo_url ? (
+            <img src={match.away_team.logo_url} alt={`Logo ${match.away_team.name}`} className="w-full h-full rounded-full object-cover" />
+          ) : (
+            match.away_team.abbr
+          )}
         </motion.div>
         <span className="text-sm text-muted-foreground font-display tracking-wider">{match.away_team.name}</span>
       </div>
     </div>
+    {(match.home_locker_room || match.away_locker_room) && (
+      <div className="mt-6 border border-primary/30 rounded-xl bg-secondary/40 p-3">
+        <p className="text-[11px] uppercase tracking-wider text-muted-foreground font-bold mb-2">Chambres</p>
+        <div className="grid grid-cols-2 gap-2 text-sm">
+          <div className="rounded-md bg-background/50 border border-border px-2 py-1.5 text-center">
+            <span className="font-display font-bold">{match.home_team.abbr}</span> · {match.home_locker_room || "N/D"}
+          </div>
+          <div className="rounded-md bg-background/50 border border-border px-2 py-1.5 text-center">
+            <span className="font-display font-bold">{match.away_team.abbr}</span> · {match.away_locker_room || "N/D"}
+          </div>
+        </div>
+      </div>
+    )}
   </motion.div>
 );
 
 const LiveScoresSection = () => {
   useRealtimeMatches();
+  const previewRooms =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("preview_rooms") === "1";
 
   const { data: matches } = useQuery({
     queryKey: ["matches"],
@@ -94,9 +121,19 @@ const LiveScoresSection = () => {
   });
 
   const validMatches = matches?.filter((m) => m.home_team && m.away_team) || [];
-  const liveMatches = validMatches.filter((m) => m.is_live);
-  const recentMatches = validMatches.filter((m) => m.status === "final");
-  const displayMatches = [...liveMatches, ...recentMatches.slice(0, Math.max(0, 4 - liveMatches.length))];
+  const byDateAsc = (a: MatchData, b: MatchData) => new Date(a.match_date).getTime() - new Date(b.match_date).getTime();
+  const liveMatches = [...validMatches.filter((m) => m.is_live)].sort(byDateAsc);
+  const recentMatches = [...validMatches.filter((m) => m.status === "final")].sort(byDateAsc);
+  const recentToDisplay = recentMatches.slice(-Math.max(0, 4 - liveMatches.length));
+  const baseDisplayMatches = [...liveMatches, ...recentToDisplay].sort(byDateAsc);
+  const displayMatches = baseDisplayMatches.map((m, i) => {
+    if (!previewRooms || m.home_locker_room || m.away_locker_room) return m;
+    return {
+      ...m,
+      home_locker_room: `Chambre ${i * 2 + 1}`,
+      away_locker_room: `Chambre ${i * 2 + 2}`,
+    };
+  });
 
   if (displayMatches.length === 0) {
     return (
@@ -109,6 +146,11 @@ const LiveScoresSection = () => {
   return (
     <div className="h-full flex flex-col justify-center px-12">
       <SectionTitle title="Scores" subtitle="Matchs en cours & récents" />
+      {previewRooms && (
+        <p className="text-center text-xs text-muted-foreground mb-3">
+          Prévisualisation des chambres (mode local)
+        </p>
+      )}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 max-w-6xl mx-auto w-full">
         {displayMatches.map((m) => (
           <ScoreCard key={m.id} match={m} isLive={m.is_live} />

@@ -203,10 +203,12 @@ export type Database = {
       matches: {
         Row: {
           away_coach_initials: string | null
+          away_locker_room: string | null
           away_score: number
           away_team_id: string
           created_at: string
           home_coach_initials: string | null
+          home_locker_room: string | null
           home_score: number
           home_team_id: string
           id: string
@@ -218,10 +220,12 @@ export type Database = {
         }
         Insert: {
           away_coach_initials?: string | null
+          away_locker_room?: string | null
           away_score?: number
           away_team_id: string
           created_at?: string
           home_coach_initials?: string | null
+          home_locker_room?: string | null
           home_score?: number
           home_team_id: string
           id?: string
@@ -233,10 +237,12 @@ export type Database = {
         }
         Update: {
           away_coach_initials?: string | null
+          away_locker_room?: string | null
           away_score?: number
           away_team_id?: string
           created_at?: string
           home_coach_initials?: string | null
+          home_locker_room?: string | null
           home_score?: number
           home_team_id?: string
           id?: string
